@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <unistd.h> 
 #include <stdio.h> 
 #include <sys/socket.h> 
@@ -7,16 +8,228 @@
 #include <arpa/inet.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <linux/userfaultfd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <poll.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+
+#define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE);	\
+	} while (0)
+
+static int page_size;
+
+
+static void * fault_handler_thread(void *arg){
+	static struct uffd_msg msg;   /* Data read from userfaultfd */
+	static int fault_cnt = 0;     /* Number of faults so far handled */
+	long uffd;                    /* userfaultfd file descriptor */
+	static char *page = NULL;
+	struct uffdio_copy uffdio_copy;
+	ssize_t nread;
+
+	uffd = (long) arg;
+
+	//printf("checkpoint 1\n");
+	/* [H1]
+	 * Create a page that will be copied into the faulting region
+	 */
+	if (page == NULL) {
+		page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (page == MAP_FAILED)
+			errExit("mmap");
+	}
+
+	/* [H2]
+	 * Loop, handling incoming events on the userfaultfd
+              file descriptor
+	 */
+	for (;;) {
+
+		/* See what poll() tells us about the userfaultfd */
+		//printf("checkpoint 2\n");
+		struct pollfd pollfd;
+		int nready;
+
+		/* [H3]
+		 * poll() polls/waits infinitely for the I/O to be available
+		 * on the "pollfd.fd" file descriptor. POLLIN parameter
+		 * of the "pollfd.events" signify that there is data to be
+		 * read.
+		 */
+		pollfd.fd = uffd;
+		pollfd.events = POLLIN;
+		nready = poll(&pollfd, 1, -1);
+		if (nready == -1)
+			errExit("poll");
+
+		printf("\nfault_handler_thread():\n");
+		printf("    poll() returns: nready = %d; "
+                       "POLLIN = %d; POLLERR = %d\n", nready,
+                       (pollfd.revents & POLLIN) != 0,
+                       (pollfd.revents & POLLERR) != 0);
+
+		/* [H4]
+		 * Read an event from the userfaultfd
+		 */
+		nread = read(uffd, &msg, sizeof(msg));
+		if (nread == 0) {
+			printf("EOF on userfaultfd!\n");
+			exit(EXIT_FAILURE);
+		}
+
+		if (nread == -1)
+			errExit("read");
+
+		/* [H5]
+		 * Only one kind of event is expected; verifying that assumption
+		 */
+		if (msg.event != UFFD_EVENT_PAGEFAULT) {
+			fprintf(stderr, "Unexpected event on userfaultfd\n");
+			exit(EXIT_FAILURE);
+		}
+
+		/* [H6]
+		 * Display info about the page-fault event
+		 */
+		printf("    UFFD_EVENT_PAGEFAULT event: ");
+		printf("flags = %llx; ", msg.arg.pagefault.flags);
+		printf("address = %llx\n", msg.arg.pagefault.address);
+
+		/* [H7]
+		 * Copy the page pointed to by 'page' into the faulting
+         * region. Add the characters varied based on the fault_count
+		 * into the page. 
+		 */
+		memset(page, '\0', page_size);
+		fault_cnt++;
+
+		/* [H8]
+		 * We need to handle page faults in units of pages(!).
+		 * So, faulting address is rounded down to page boundry
+		 */
+		uffdio_copy.src = (unsigned long) page;
+		uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+			~(page_size - 1);
+		uffdio_copy.len = page_size;
+		uffdio_copy.mode = 0;
+		uffdio_copy.copy = 0;
+
+		/* [H9]
+		 * The ioctl() system call manipulates the underlying device 
+		 * parameters of special files. UFFDIO_COPY facilitates atomic copy 
+		 * of a continous memory chunk into the userfault registered range, 
+		 * whose parameters are specified above.
+		 */
+		if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+			errExit("ioctl-UFFDIO_COPY");
+
+		/* [H10]
+		 * Prints the memory size allocated, i.e., number of bytes
+		 * copied
+		 */
+		//printf("        (uffdio_copy.copy returned %lld)\n",
+                //       uffdio_copy.copy);
+
+		printf("[x] PAGEFAULT\n");
+	}
+}
+
+void read_and_print_page(char * addr, int page_num){
+	char message[4096];
+        strcpy(message, addr);
+        printf("[*] Page %d:\n%s\n", page_num, message);
+}
+
+void write_page(char * addr, char * message){
+	int j = 0;
+	while (j <= strlen(message)){
+		memset(addr+j, *(message+j), 1);
+		j++;
+	}
+}
+
+int perform_read_write_actions(char * mmapped_addr, int num_pages){
+		while (1){
+			char command_option;
+			int page_number_option;	
+			char write_message_buffer[page_size];
+
+			printf("Which command should I run? (r:read, w:write):");
+			scanf(" %c", &command_option);
+
+			if (command_option != 'r' && command_option != 'w'){
+				printf("Thanks for stopping by\n");
+				return 0;
+			}
+
+			printf("For which page?(0-%d, or -1 for all):", num_pages-1);
+			scanf("%d", &page_number_option);
+			
+			if (command_option == 'w'){
+				printf("> Type your new message:");
+				scanf(" %[^\n]%*c", write_message_buffer);	// not very safe, using it because of upper limit on message
+			}
+
+			if (page_number_option == -1){
+				int i=0;
+				int l = 0x0;
+				if (command_option == 'r'){
+					while (i < num_pages){
+						read_and_print_page(mmapped_addr+l, i);
+						i++;
+						l = l + page_size;
+					}
+				}
+				else {
+					while (i < num_pages){
+						write_page(mmapped_addr+l, write_message_buffer);
+						read_and_print_page(mmapped_addr+l, i);
+						i++;
+                                                l = l + page_size;
+                                        }
+				}	
+			}
+			else {
+				int l = 0x0;
+				l = l + page_number_option * page_size;
+				if (command_option == 'r'){
+					read_and_print_page(mmapped_addr+l, page_number_option);
+				}
+				else {
+					write_page(mmapped_addr+l, write_message_buffer);
+					read_and_print_page(mmapped_addr+l, page_number_option);
+				}
+			}
+		}
+}
 
 
 int main(int argc, char const *argv[]) 
 {
-	int local_port_number, remote_port_number, num_pages, page_size, len, x;
+	int local_port_number, remote_port_number, num_pages, x;
 	int remote_server_sock = 0, local_server_sock = 0, new_socket = 0, option = 1;
 	struct sockaddr_in self_address, serv_addr;
 	int addrlen = sizeof(self_address);
 	char * mmapped_addr;
-	long y=0;
+	long mmapped_addr_long=0;
+	long uffd;          /* userfaultfd file descriptor */
+        unsigned long len;  /* Length of region handled by userfaultfd */
+        pthread_t thr;      /* ID of thread that handles page faults */
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        int s;
+	int l;
+
+
 
 	if (argc != 3) {
 		fprintf(stderr, "invalid number of arguments");
@@ -90,37 +303,65 @@ int main(int argc, char const *argv[])
 		if (mmapped_addr == MAP_FAILED)
 			printf("memory allocation unsuccessful\n");
 		else 
-			printf("memory allocation successful, mmapped address = %p, mmapped size = %d\n", 
+			printf("memory allocation successful, mmapped address = %p, mmapped size = %ld\n", 
 					mmapped_addr, len);
 
-		y = (unsigned long) mmapped_addr;
+		mmapped_addr_long = (unsigned long) mmapped_addr;
 
-		send (new_socket, &y, sizeof(y), 0);
+		send (new_socket, &mmapped_addr_long, sizeof(mmapped_addr_long), 0);
 		//printf("Mapped address pointer sent to client\n");
 
 		send (new_socket, &len, sizeof(len), 0);
 		//printf("Mapped size sent to client\n");
+		
+		uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+		
+		if (uffd == -1)
+		errExit("userfaultfd");
 
+		uffdio_api.api = UFFD_API;
+		uffdio_api.features = 0;
+		if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+		errExit("ioctl-UFFDIO_API");
+
+		uffdio_register.range.start = (unsigned long) mmapped_addr;
+		uffdio_register.range.len = len;
+		uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+		if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+		errExit("ioctl-UFFDIO_REGISTER");
+
+
+		s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+		if (s != 0) {
+			errno = s;
+			errExit("pthread_create");
+		}
+
+		
+		printf("-----------------------------------------------------\n");
+
+		perform_read_write_actions(mmapped_addr, num_pages);
+		
 		return 0;
 
     	}
 
- 	x = read (remote_server_sock, &y, sizeof(y));
+ 	x = read (remote_server_sock, &mmapped_addr_long, sizeof(mmapped_addr_long));
 	printf("number of bytes read %d\n", x);
 	if (x > 0){
-		mmapped_addr = (char *) y;
+		mmapped_addr = (char *) mmapped_addr_long;
 	}
 
 	if (read(remote_server_sock, &len, sizeof(len)) < 0){
                 printf("len read failed\n");
         } 
      
-	mmapped_addr = mmap((char *)y, len, PROT_READ | PROT_WRITE,
+	mmapped_addr = mmap((char *)mmapped_addr_long, len, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
                 if (mmapped_addr == MAP_FAILED)
                         printf("memory allocation unsuccessful\n");
                 else
-                        printf("memory allocation successful, mmapped address = %p, mmapped size = %d\n", mmapped_addr, len);
+                        printf("memory allocation successful, mmapped address = %p, mmapped size = %ld\n", mmapped_addr, len);
 	
 	
 	return 0;
