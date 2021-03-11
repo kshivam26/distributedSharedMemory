@@ -212,6 +212,36 @@ int perform_read_write_actions(char * mmapped_addr, int num_pages){
 		}
 }
 
+void setup_userfaultfd(char * mmapped_addr, unsigned long len){
+	long uffd;
+        pthread_t thr;      /* ID of thread that handles page faults */
+        struct uffdio_api uffdio_api;
+        struct uffdio_register uffdio_register;
+        int s;
+
+	uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+
+        if (uffd == -1)
+        	errExit("userfaultfd");
+
+        uffdio_api.api = UFFD_API;
+        uffdio_api.features = 0;
+        if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+        	errExit("ioctl-UFFDIO_API");
+
+        uffdio_register.range.start = (unsigned long) mmapped_addr;
+        uffdio_register.range.len = len;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+ 	       errExit("ioctl-UFFDIO_REGISTER");
+
+
+        s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+        if (s != 0) {
+        	errno = s;
+                errExit("pthread_create");
+        }
+}
 
 int main(int argc, char const *argv[]) 
 {
@@ -221,15 +251,7 @@ int main(int argc, char const *argv[])
 	int addrlen = sizeof(self_address);
 	char * mmapped_addr;
 	long mmapped_addr_long=0;
-	long uffd;          /* userfaultfd file descriptor */
         unsigned long len;  /* Length of region handled by userfaultfd */
-        pthread_t thr;      /* ID of thread that handles page faults */
-        struct uffdio_api uffdio_api;
-        struct uffdio_register uffdio_register;
-        int s;
-	int l;
-
-
 
 	if (argc != 3) {
 		fprintf(stderr, "invalid number of arguments");
@@ -314,30 +336,8 @@ int main(int argc, char const *argv[])
 		send (new_socket, &len, sizeof(len), 0);
 		//printf("Mapped size sent to client\n");
 		
-		uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-		
-		if (uffd == -1)
-		errExit("userfaultfd");
+		setup_userfaultfd(mmapped_addr, len);	
 
-		uffdio_api.api = UFFD_API;
-		uffdio_api.features = 0;
-		if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
-		errExit("ioctl-UFFDIO_API");
-
-		uffdio_register.range.start = (unsigned long) mmapped_addr;
-		uffdio_register.range.len = len;
-		uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
-		if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
-		errExit("ioctl-UFFDIO_REGISTER");
-
-
-		s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
-		if (s != 0) {
-			errno = s;
-			errExit("pthread_create");
-		}
-
-		
 		printf("-----------------------------------------------------\n");
 
 		perform_read_write_actions(mmapped_addr, num_pages);
@@ -345,6 +345,8 @@ int main(int argc, char const *argv[])
 		return 0;
 
     	}
+
+	page_size = sysconf(_SC_PAGE_SIZE);
 
  	x = read (remote_server_sock, &mmapped_addr_long, sizeof(mmapped_addr_long));
 	printf("number of bytes read %d\n", x);
@@ -362,8 +364,13 @@ int main(int argc, char const *argv[])
                         printf("memory allocation unsuccessful\n");
                 else
                         printf("memory allocation successful, mmapped address = %p, mmapped size = %ld\n", mmapped_addr, len);
-	
-	
+
+	num_pages = len/page_size;
+
+	setup_userfaultfd(mmapped_addr, len);
+
+	perform_read_write_actions(mmapped_addr, num_pages);
+
 	return 0;
 }
 
