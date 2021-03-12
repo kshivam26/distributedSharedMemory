@@ -37,10 +37,6 @@ static void * fault_handler_thread(void *arg){
 
 	uffd = (long) arg;
 
-	//printf("checkpoint 1\n");
-	/* [H1]
-	 * Create a page that will be copied into the faulting region
-	 */
 	if (page == NULL) {
 		page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -48,38 +44,18 @@ static void * fault_handler_thread(void *arg){
 			errExit("mmap");
 	}
 
-	/* [H2]
-	 * Loop, handling incoming events on the userfaultfd
-              file descriptor
-	 */
 	for (;;) {
 
-		/* See what poll() tells us about the userfaultfd */
-		//printf("checkpoint 2\n");
 		struct pollfd pollfd;
 		int nready;
 
-		/* [H3]
-		 * poll() polls/waits infinitely for the I/O to be available
-		 * on the "pollfd.fd" file descriptor. POLLIN parameter
-		 * of the "pollfd.events" signify that there is data to be
-		 * read.
-		 */
 		pollfd.fd = uffd;
 		pollfd.events = POLLIN;
 		nready = poll(&pollfd, 1, -1);
 		if (nready == -1)
 			errExit("poll");
 
-		printf("\nfault_handler_thread():\n");
-		printf("    poll() returns: nready = %d; "
-                       "POLLIN = %d; POLLERR = %d\n", nready,
-                       (pollfd.revents & POLLIN) != 0,
-                       (pollfd.revents & POLLERR) != 0);
 
-		/* [H4]
-		 * Read an event from the userfaultfd
-		 */
 		nread = read(uffd, &msg, sizeof(msg));
 		if (nread == 0) {
 			printf("EOF on userfaultfd!\n");
@@ -89,33 +65,14 @@ static void * fault_handler_thread(void *arg){
 		if (nread == -1)
 			errExit("read");
 
-		/* [H5]
-		 * Only one kind of event is expected; verifying that assumption
-		 */
 		if (msg.event != UFFD_EVENT_PAGEFAULT) {
 			fprintf(stderr, "Unexpected event on userfaultfd\n");
 			exit(EXIT_FAILURE);
 		}
 
-		/* [H6]
-		 * Display info about the page-fault event
-		 */
-		printf("    UFFD_EVENT_PAGEFAULT event: ");
-		printf("flags = %llx; ", msg.arg.pagefault.flags);
-		printf("address = %llx\n", msg.arg.pagefault.address);
-
-		/* [H7]
-		 * Copy the page pointed to by 'page' into the faulting
-         * region. Add the characters varied based on the fault_count
-		 * into the page. 
-		 */
 		memset(page, '\0', page_size);
 		fault_cnt++;
 
-		/* [H8]
-		 * We need to handle page faults in units of pages(!).
-		 * So, faulting address is rounded down to page boundry
-		 */
 		uffdio_copy.src = (unsigned long) page;
 		uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
 			~(page_size - 1);
@@ -123,21 +80,8 @@ static void * fault_handler_thread(void *arg){
 		uffdio_copy.mode = 0;
 		uffdio_copy.copy = 0;
 
-		/* [H9]
-		 * The ioctl() system call manipulates the underlying device 
-		 * parameters of special files. UFFDIO_COPY facilitates atomic copy 
-		 * of a continous memory chunk into the userfault registered range, 
-		 * whose parameters are specified above.
-		 */
 		if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
 			errExit("ioctl-UFFDIO_COPY");
-
-		/* [H10]
-		 * Prints the memory size allocated, i.e., number of bytes
-		 * copied
-		 */
-		//printf("        (uffdio_copy.copy returned %lld)\n",
-                //       uffdio_copy.copy);
 
 		printf("[x] PAGEFAULT\n");
 	}
@@ -163,7 +107,7 @@ int perform_read_write_actions(char * mmapped_addr, int num_pages){
 			int page_number_option;	
 			char write_message_buffer[page_size];
 
-			printf("Which command should I run? (r:read, w:write):");
+			printf("Which command should I run? (r:read, w:write, 1:exit):");
 			scanf(" %c", &command_option);
 
 			if (command_option != 'r' && command_option != 'w'){
