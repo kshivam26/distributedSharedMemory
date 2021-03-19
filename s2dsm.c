@@ -1,8 +1,9 @@
 #define _GNU_SOURCE
 #include <unistd.h> 
 #include <stdio.h> 
+#include <stdlib.h>
 #include <sys/socket.h> 
-#include <stdlib.h> 
+#include <stdbool.h> 
 #include <netinet/in.h> 
 #include <string.h>
 #include <arpa/inet.h>
@@ -26,16 +27,55 @@
 
 static int page_size;
 
+typedef enum msi{M, S, I} MSI;
+
+MSI * msi_array;
+
+pthread_mutex_t lock;
+
+typedef struct msi_listener{
+	char * addr;
+	int socket;
+}msi_listener;
+
+typedef struct userfaultfd_data{
+	char * addr;
+	long uffd;
+	int socket;
+}userfaultfd_data;
+
+typedef struct msi_data{
+	int page_num;
+	char operation;
+	MSI requester_page_state;
+}msi_data;
+
+typedef struct msi_client_response{
+	char message[4096];
+	bool invalid_state;
+}msi_client_response;
+
+void write_page(char * addr, char * message){
+	int j = 0;
+	while (j <= strlen(message)){
+		memset(addr+j, *(message+j), 1);
+		j++;
+	}
+}
 
 static void * fault_handler_thread(void *arg){
 	static struct uffd_msg msg;   /* Data read from userfaultfd */
-	static int fault_cnt = 0;     /* Number of faults so far handled */
+	static int socket;
 	long uffd;                    /* userfaultfd file descriptor */
 	static char *page = NULL;
 	struct uffdio_copy uffdio_copy;
 	ssize_t nread;
+	char * addr;
+	userfaultfd_data * data = arg;
 
-	uffd = (long) arg;
+	uffd = data->uffd;
+	addr = data->addr;
+	socket = data->socket;
 
 	if (page == NULL) {
 		page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
@@ -70,9 +110,46 @@ static void * fault_handler_thread(void *arg){
 			exit(EXIT_FAILURE);
 		}
 
-		memset(page, '\0', page_size);
-		fault_cnt++;
 
+		if (msg.arg.pagefault.flags == UFFD_PAGEFAULT_FLAG_WRITE){
+                        msi_data data;
+                        int curr_page_num = (msg.arg.pagefault.address - (long long)addr)/page_size;
+                        data.page_num = curr_page_num;
+                        data.requester_page_state = msi_array[curr_page_num];
+                        data.operation = 'w';
+                        send(socket, &data, sizeof(data), 0);
+
+			msi_array[curr_page_num] = M;
+			memset(page, '\0', page_size);
+		}
+		else{
+			msi_client_response response;
+			msi_data data;
+			int curr_page_num = (msg.arg.pagefault.address - (long long)addr)/page_size;
+			data.page_num = curr_page_num;
+			data.requester_page_state = msi_array[curr_page_num];
+			data.operation = 'r';
+			pthread_mutex_lock(&lock);
+			
+			send(socket, &data, sizeof(data), 0);
+
+			while(1){
+				if(read(socket, &response, sizeof(response)) < 0){
+					continue;
+				}
+				else{
+					break;
+				}
+			}
+
+			pthread_mutex_unlock(&lock);
+
+			if (response.invalid_state == 0){
+				msi_array[curr_page_num] = S;
+				write_page(page, response.message);
+			}
+		}
+		
 		uffdio_copy.src = (unsigned long) page;
 		uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
 			~(page_size - 1);
@@ -83,41 +160,49 @@ static void * fault_handler_thread(void *arg){
 		if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
 			errExit("ioctl-UFFDIO_COPY");
 
-		printf("[x] PAGEFAULT\n");
 	}
 }
 
 void read_and_print_page(char * addr, int page_num){
 	char message[4096];
         strcpy(message, addr);
+	if(msi_array[page_num] == I){
+		if (madvise(addr, page_size, MADV_DONTNEED)){
+			printf("failed to madvise");
+		}
+		return;
+	}
         printf("[*] Page %d:\n%s\n", page_num, message);
 }
 
-void write_page(char * addr, char * message){
-	int j = 0;
-	while (j <= strlen(message)){
-		memset(addr+j, *(message+j), 1);
-		j++;
+void printMSIValue(MSI msi){
+	switch(msi){
+		case M: printf("M ");
+			break;
+		case S: printf("S ");
+			break;
+		case I: printf("I ");
+			break;
 	}
 }
 
-int perform_read_write_actions(char * mmapped_addr, int num_pages){
+int perform_read_write_actions(char * mmapped_addr, int num_pages, int socket){
 		while (1){
 			char command_option;
 			int page_number_option;	
 			char write_message_buffer[page_size];
 
-			printf("Which command should I run? (r:read, w:write, 1:exit):");
+			printf("Which command should I run? (r:read, w:write, v:view msi array, 1:exit):");
 			scanf(" %c", &command_option);
 
-			if (command_option != 'r' && command_option != 'w'){
+			if (command_option != 'r' && command_option != 'w' && command_option != 'v'){
 				printf("Thanks for stopping by\n");
 				return 0;
 			}
-
+						
 			printf("For which page?(0-%d, or -1 for all):", num_pages-1);
 			scanf("%d", &page_number_option);
-			
+
 			if (command_option == 'w'){
 				printf("> Type your new message:");
 				scanf(" %[^\n]%*c", write_message_buffer);	// not very safe, using it because of upper limit on message
@@ -133,8 +218,25 @@ int perform_read_write_actions(char * mmapped_addr, int num_pages){
 						l = l + page_size;
 					}
 				}
+				else if (command_option == 'v'){
+					printf("MSI array contents:\n");
+					for (int i=0; i < num_pages; i++){
+						printMSIValue(msi_array[i]);
+					}
+					printf("\n");
+				}
 				else {
 					while (i < num_pages){
+						msi_data data;
+	                                        data.page_num = i;
+        	                                data.requester_page_state = msi_array[i];
+                	                        data.operation = 'w';
+
+                        	                if (msi_array[i] == S){
+                                	                send(socket, &data, sizeof(data), 0);
+                                        	        msi_array[i] = M;
+	                                        }	
+
 						write_page(mmapped_addr+l, write_message_buffer);
 						read_and_print_page(mmapped_addr+l, i);
 						i++;
@@ -142,13 +244,28 @@ int perform_read_write_actions(char * mmapped_addr, int num_pages){
                                         }
 				}	
 			}
-			else {
+			else {	
 				int l = 0x0;
 				l = l + page_number_option * page_size;
 				if (command_option == 'r'){
 					read_and_print_page(mmapped_addr+l, page_number_option);
 				}
+				else if(command_option == 'v'){
+					printf("MSI array for page number %d\n", page_number_option);
+					printMSIValue(msi_array[page_number_option]);
+					printf("\n");
+				}
 				else {
+					msi_data data;
+					data.page_num = page_number_option;
+	        	                data.requester_page_state = msi_array[page_number_option];
+        	        	        data.operation = 'w';
+
+					if (msi_array[page_number_option] == S){
+						send(socket, &data, sizeof(data), 0);
+						msi_array[page_number_option] = M;
+					}
+
 					write_page(mmapped_addr+l, write_message_buffer);
 					read_and_print_page(mmapped_addr+l, page_number_option);
 				}
@@ -156,7 +273,7 @@ int perform_read_write_actions(char * mmapped_addr, int num_pages){
 		}
 }
 
-void setup_userfaultfd(char * mmapped_addr, unsigned long len){
+void setup_userfaultfd(char * mmapped_addr, unsigned long len, long socket){
 	long uffd;
         pthread_t thr;      /* ID of thread that handles page faults */
         struct uffdio_api uffdio_api;
@@ -167,6 +284,11 @@ void setup_userfaultfd(char * mmapped_addr, unsigned long len){
 
         if (uffd == -1)
         	errExit("userfaultfd");
+
+	userfaultfd_data * uffd_data = (userfaultfd_data *)malloc(sizeof(userfaultfd_data));
+	uffd_data->addr = mmapped_addr;
+	uffd_data->uffd = uffd;
+	uffd_data->socket = socket;
 
         uffdio_api.api = UFFD_API;
         uffdio_api.features = 0;
@@ -180,22 +302,77 @@ void setup_userfaultfd(char * mmapped_addr, unsigned long len){
  	       errExit("ioctl-UFFDIO_REGISTER");
 
 
-        s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+        s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd_data);
         if (s != 0) {
         	errno = s;
                 errExit("pthread_create");
         }
 }
 
+static void * msi_handler_thread(void * arg){
+	msi_data data;
+	msi_listener * listener = (msi_listener *) arg;
+	int flags = fcntl(listener->socket, F_GETFL, 0);
+	fcntl(listener->socket, F_SETFL, flags | O_NONBLOCK);
+
+	while(1){
+		pthread_mutex_lock(&lock);
+
+		if (read(listener->socket, &data, sizeof(data)) < 0){
+			pthread_mutex_unlock(&lock);
+			continue;
+        	}
+
+		pthread_mutex_unlock(&lock);
+
+		if (data.operation == 'r'){
+			if (data.requester_page_state == I){
+				if (msi_array[data.page_num] == 0){
+					msi_client_response response;
+					response.invalid_state = 0;
+					msi_array[data.page_num] = S;
+        				strcpy(response.message, listener->addr+data.page_num*page_size);
+					send(listener->socket, &response, sizeof(response), 0);
+				}
+				else if (msi_array[data.page_num] == 2){
+					msi_client_response response;
+					response.message[0] = '\0';
+					response.invalid_state = 1;
+					if(send(listener->socket, &response, sizeof(response), 0) < 0){
+						printf("error in sending msi read response\n");
+					}
+				}
+			}
+		}
+		if (data.operation == 'w'){
+			if (data.requester_page_state == I){
+                                if (msi_array[data.page_num] == M){
+					msi_array[data.page_num] = I;
+                                	madvise(listener->addr+data.page_num*page_size, page_size, MADV_DONTNEED);
+				}
+                        }
+			else if (data.requester_page_state == S){
+				if (msi_array[data.page_num] == S){
+                                        msi_array[data.page_num] = I;
+					madvise(listener->addr+data.page_num*page_size, page_size, MADV_DONTNEED);
+                                }
+			}
+		}
+	}
+	
+}
+
 int main(int argc, char const *argv[]) 
 {
-	int local_port_number, remote_port_number, num_pages, x;
+	int local_port_number, remote_port_number, num_pages, x, s;
 	int remote_server_sock = 0, local_server_sock = 0, new_socket = 0, option = 1;
 	struct sockaddr_in self_address, serv_addr;
 	int addrlen = sizeof(self_address);
 	char * mmapped_addr;
 	long mmapped_addr_long=0;
         unsigned long len;  /* Length of region handled by userfaultfd */
+	pthread_t listen_t;
+	msi_listener msiListener;
 
 	if (argc != 3) {
 		fprintf(stderr, "invalid number of arguments");
@@ -261,11 +438,17 @@ int main(int argc, char const *argv[])
 			printf("num_pages read is %d\n", num_pages);
 		}
 
+		//create and initialize msi_array
+		msi_array = (MSI *) malloc (num_pages);  //free this
+		for (int k = 0; k < num_pages; k++){
+			msi_array[k] = I;
+		}
+
 		page_size = sysconf(_SC_PAGE_SIZE);
 		len = num_pages * page_size;
 
 		mmapped_addr = mmap(NULL, len, PROT_READ | PROT_WRITE,
-		    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (mmapped_addr == MAP_FAILED)
 			printf("memory allocation unsuccessful\n");
 		else 
@@ -278,14 +461,23 @@ int main(int argc, char const *argv[])
 		//printf("Mapped address pointer sent to client\n");
 
 		send (new_socket, &len, sizeof(len), 0);
-		//printf("Mapped size sent to client\n");
-		
-		setup_userfaultfd(mmapped_addr, len);	
+		//printf("Mapped isize sent to client\n");
+	
+		msiListener.socket = new_socket;
+		msiListener.addr = mmapped_addr;
+		s = pthread_create(&listen_t, NULL, msi_handler_thread, (void *) &msiListener);
+		if (s != 0) {
+			errno = s;
+			errExit("pthread_create");
+		}
+
+		setup_userfaultfd(mmapped_addr, len, new_socket);	
 
 		printf("-----------------------------------------------------\n");
 
-		perform_read_write_actions(mmapped_addr, num_pages);
-		
+		perform_read_write_actions(mmapped_addr, num_pages, new_socket);
+	
+		free(msi_array);	
 		return 0;
 
     	}
@@ -303,7 +495,7 @@ int main(int argc, char const *argv[])
         } 
      
 	mmapped_addr = mmap((char *)mmapped_addr_long, len, PROT_READ | PROT_WRITE,
-                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (mmapped_addr == MAP_FAILED)
                         printf("memory allocation unsuccessful\n");
                 else
@@ -311,9 +503,25 @@ int main(int argc, char const *argv[])
 
 	num_pages = len/page_size;
 
-	setup_userfaultfd(mmapped_addr, len);
+	msi_array = (MSI *) malloc (num_pages);  //free this
+        for (int k = 0; k < num_pages; k++){
+        	msi_array[k] = I;
+        }
 
-	perform_read_write_actions(mmapped_addr, num_pages);
+	msiListener.socket = remote_server_sock;
+        msiListener.addr = mmapped_addr;
+        s = pthread_create(&listen_t, NULL, msi_handler_thread, (void *) &msiListener);
+        if (s != 0) {
+        	errno = s;
+                errExit("pthread_create");
+       	}
+
+
+	setup_userfaultfd(mmapped_addr, len, remote_server_sock);
+
+	perform_read_write_actions(mmapped_addr, num_pages, remote_server_sock);
+
+	free(msi_array);
 
 	return 0;
 }
